@@ -3,6 +3,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TeleportService = game:GetService("TeleportService")
 local TweenService = game:GetService("TweenService")
 local HttpService = game:GetService("HttpService")
+local GuiService = game:GetService("GuiService")
 local player = Players.LocalPlayer
 local defaultMaxPlayers = 12
 if type(Players.MaxPlayers) == "number" and Players.MaxPlayers > 0 then
@@ -46,28 +47,14 @@ end
 
 local settings = {
     autoExecute = false,
-    loader = "assist_astra.lua",
+    loader = "",
 }
 
 local saved = readJson(settingsFile)
-local hasLoader = false
 if saved then
     if type(saved.autoExecute) == "boolean" then settings.autoExecute = saved.autoExecute end
-    if type(saved.loader) == "string" and saved.loader ~= "" then
+    if type(saved.loader) == "string" and saved.loader ~= "" and saved.loader ~= "assist_astra.lua" then
         settings.loader = saved.loader
-        hasLoader = true
-    end
-end
-
-if not hasLoader and type(isfile) == "function"
-    and type(debug) == "table" and type(debug.info) == "function" then
-    local ok, source = pcall(debug.info, 1, "s")
-    if ok and type(source) == "string" then
-        local path = source:gsub("^[@=]", "")
-        local fok, exists = pcall(isfile, path)
-        if path ~= "" and fok and exists then
-            settings.loader = path
-        end
     end
 end
 
@@ -80,6 +67,7 @@ local function normalizeId(id)
 end
 
 local visited = {}
+local failedServers = {}
 
 local function markVisited(id)
     local key = normalizeId(id)
@@ -128,7 +116,7 @@ if type(_G.AssistVisitedServers) == "table" then
         if value == true or value == 1 then
             markVisited(id)
         elseif type(value) == "string" then
-            markVisited(value)
+            markVisited(id)
         end
     end
 end
@@ -155,6 +143,46 @@ local function getQueueFunction()
         if ok and type(env) == "table" and type(env.queue_on_teleport) == "function" then
             return env.queue_on_teleport
         end
+    end
+    return nil
+end
+
+local function getHttpRequestFunction()
+    if type(request) == "function" then return request end
+    if type(http_request) == "function" then return http_request end
+    if type(http) == "table" and type(http.request) == "function" then return http.request end
+    if type(syn) == "table" and type(syn.request) == "function" then return syn.request end
+    if type(fluxus) == "table" and type(fluxus.request) == "function" then return fluxus.request end
+    if type(getgenv) == "function" then
+        local ok, env = pcall(getgenv)
+        if ok and type(env) == "table" then
+            if type(env.request) == "function" then return env.request end
+            if type(env.http_request) == "function" then return env.http_request end
+        end
+    end
+    return nil
+end
+
+local function httpGetUrl(url)
+    local reqFn = getHttpRequestFunction()
+    if reqFn then
+        local ok, res = pcall(reqFn, {
+            Url = url,
+            Method = "GET",
+        })
+        if ok and type(res) == "table" then
+            local status = tonumber(res.StatusCode or res.Status) or 200
+            if status >= 200 and status < 300 and type(res.Body) == "string" and res.Body ~= "" then
+                return res.Body
+            end
+        end
+    end
+
+    local ok, body = pcall(function()
+        return game:HttpGet(url)
+    end)
+    if ok and type(body) == "string" and body ~= "" then
+        return body
     end
     return nil
 end
@@ -189,12 +217,11 @@ local getServers = ReplicatedStorage:WaitForChild("Chest")
     :WaitForChild("GetServers")
 
 local servers = {}
+local publicServers = {}
+local remoteServersCache = {}
 local serverCodes = {}
 local serverGeneration = 0
 local currentServerName
-local currentServerCode
-local currentServerCodeField
-local currentServerRaw
 local setStatus
 
 local function readNumber(server, keys)
@@ -232,18 +259,81 @@ local function readServerName(server)
     return nil
 end
 
+local function isRestrictedServer(server)
+    if server.Private == true
+        or server.IsPrivate == true
+        or server.Reserved == true
+        or server.Locked == true
+        or server.IsReserved == true then
+        return true
+    end
+    if type(server.AccessCode) == "string" and server.AccessCode ~= "" then
+        return true
+    end
+    if type(server.ServerType) == "string" and server.ServerType:lower():find("private", 1, true) then
+        return true
+    end
+    return false
+end
+
+local function rebuildServerList(remoteList)
+    local byKey = {}
+    local merged = {}
+    local currentKey = normalizeId(game.JobId)
+
+    local function upsert(entry)
+        local key = normalizeId(entry.id)
+        if not key then return end
+
+        local existing = byKey[key]
+        if existing then
+            if entry.name and not existing.name then existing.name = entry.name end
+            if entry.restricted then existing.restricted = true end
+            if entry.players and (not existing.players or entry.source == "roblox") then
+                existing.players = entry.players
+            end
+            if entry.maxPlayers then existing.maxPlayers = entry.maxPlayers end
+            if entry.placeId then existing.placeId = entry.placeId end
+        else
+            byKey[key] = entry
+            merged[#merged + 1] = entry
+        end
+    end
+
+    for _, entry in ipairs(remoteList) do
+        upsert(entry)
+    end
+    for _, entry in ipairs(publicServers) do
+        upsert(entry)
+    end
+
+    table.sort(merged, function(a, b)
+        return (a.players or 999) < (b.players or 999)
+    end)
+
+    servers = merged
+
+    if setStatus then
+        local fresh = 0
+        for _, entry in ipairs(merged) do
+            local key = normalizeId(entry.id)
+            if key and key ~= currentKey and not entry.restricted and not visited[key] and not failedServers[key] then
+                fresh = fresh + 1
+            end
+        end
+        setStatus(string.format("серверов: %d · новых: %d", #merged, fresh), MUTED)
+    end
+end
+
 local function applyServers(result)
     serverGeneration = serverGeneration + 1
     local parsed = {}
     local codes = {}
     local foundCurrentName
-    local foundCurrentCode
-    local foundCurrentField
-    local foundCurrentRaw
     local currentKey = normalizeId(game.JobId)
 
     for key, server in pairs(result) do
-        if type(server) == "table" and server.CreatedAt then
+        if type(server) == "table" then
             local rawId = server.JobId
             if type(rawId) ~= "string" or rawId == "" then
                 rawId = server.JobID or server.jobId or server.ServerId or server.ServerID
@@ -254,14 +344,11 @@ local function applyServers(result)
             if not count and type(server.Players) == "table" then count = #server.Players end
             local maxPlayers = readNumber(server, {"MaxPlayers", "Capacity", "Max", "maxPlayers", "capacity"}) or defaultMaxPlayers
             if id ~= "" and count and count <= maxPlayers then
-                local name, nameField = readServerName(server)
+                local name = readServerName(server)
                 local normalized = normalizeId(id)
                 if name and normalized then codes[normalized] = name end
                 if normalized and normalized == currentKey and name then
                     foundCurrentName = name
-                    foundCurrentCode = name:match("#%s*(%d+)") or name
-                    foundCurrentField = nameField
-                    foundCurrentRaw = server
                 end
                 parsed[#parsed + 1] = {
                     id = id,
@@ -269,31 +356,94 @@ local function applyServers(result)
                     placeId = tonumber(server.PlaceId) or game.PlaceId,
                     players = count,
                     maxPlayers = maxPlayers,
+                    restricted = isRestrictedServer(server),
+                    source = "remote",
                 }
             end
         end
     end
 
-    servers = parsed
+    remoteServersCache = parsed
     serverCodes = codes
 
     if foundCurrentName then
         currentServerName = foundCurrentName
-        currentServerCode = foundCurrentCode
-        currentServerCodeField = foundCurrentField
-        currentServerRaw = foundCurrentRaw
     end
 
-    if setStatus then
-        local fresh = 0
-        for _, entry in ipairs(parsed) do
-            local key = normalizeId(entry.id)
-            if key and key ~= currentKey and not visited[key] then
-                fresh = fresh + 1
+    rebuildServerList(remoteServersCache)
+end
+
+local function fetchRobloxPublicServers(maxPages)
+    local hosts = {
+        "https://games.roblox.com",
+        "https://games.roproxy.com",
+    }
+    local collected = {}
+    local currentKey = normalizeId(game.JobId)
+
+    for _, host in ipairs(hosts) do
+        local cursor = ""
+        local anySuccess = false
+
+        for _ = 1, (maxPages or 3) do
+            local url = string.format(
+                "%s/v1/games/%s/servers/Public?sortOrder=Asc&limit=100%s",
+                host,
+                tostring(game.PlaceId),
+                cursor ~= "" and ("&cursor=" .. HttpService:UrlEncode(cursor)) or ""
+            )
+
+            local body = httpGetUrl(url)
+            if not body then break end
+
+            local dok, decoded = pcall(HttpService.JSONDecode, HttpService, body)
+            if not dok or type(decoded) ~= "table" or type(decoded.data) ~= "table" then
+                break
             end
+
+            anySuccess = true
+            local hasUnvisitedOnPage = false
+
+            for _, s in ipairs(decoded.data) do
+                if type(s) == "table" and type(s.id) == "string" and s.id ~= "" then
+                    local playing = tonumber(s.playing) or 0
+                    local maxP = tonumber(s.maxPlayers) or defaultMaxPlayers
+                    if playing > 0 and playing < maxP then
+                        local key = normalizeId(s.id)
+                        if key and key ~= currentKey and not visited[key] and not failedServers[key] then
+                            hasUnvisitedOnPage = true
+                        end
+                        collected[#collected + 1] = {
+                            id = s.id,
+                            name = key and serverCodes[key] or nil,
+                            placeId = game.PlaceId,
+                            players = playing,
+                            maxPlayers = maxP,
+                            restricted = false,
+                            source = "roblox",
+                        }
+                    end
+                end
+            end
+
+            local nextCursor = decoded.nextPageCursor
+            if type(nextCursor) ~= "string" or nextCursor == "" or hasUnvisitedOnPage then
+                break
+            end
+            cursor = nextCursor
         end
-        setStatus(string.format("серверов: %d · новых: %d", #parsed, fresh), MUTED)
+
+        if anySuccess then
+            break
+        end
     end
+
+    if #collected > 0 then
+        publicServers = collected
+        rebuildServerList(remoteServersCache)
+        return true
+    end
+    return false
 end
 
 local oldInvoke
@@ -317,7 +467,8 @@ screen.Parent = playerGui
 
 local WIDTH = 262
 local BASE_HEIGHT = 108
-local OPEN_HEIGHT = 238
+local MAIN_OPEN_HEIGHT = 188
+local HP_OPEN_HEIGHT = 243
 
 local function corner(object, radius)
     local c = Instance.new("UICorner")
@@ -558,11 +709,12 @@ copyButton.MouseButton1Click:Connect(function()
 end)
 
 local panel = Instance.new("Frame")
-panel.Size = UDim2.fromOffset(250, 170)
+panel.Size = UDim2.fromOffset(250, 120)
 panel.Position = UDim2.fromOffset(6, 40)
 panel.BackgroundColor3 = PANEL
 panel.BorderSizePixel = 0
 panel.Visible = false
+panel.ClipsDescendants = true
 panel.ZIndex = 2
 panel.Parent = frame
 corner(panel, 6)
@@ -604,45 +756,23 @@ tabHp.Parent = panel
 corner(tabHp, 5)
 
 local mainPage = Instance.new("Frame")
-mainPage.Size = UDim2.new(1, 0, 0, 140)
+mainPage.Size = UDim2.new(1, 0, 0, 90)
 mainPage.Position = UDim2.fromOffset(0, 30)
 mainPage.BackgroundTransparency = 1
 mainPage.ZIndex = 3
 mainPage.Parent = panel
 
 local hpPage = Instance.new("Frame")
-hpPage.Size = UDim2.new(1, 0, 0, 140)
+hpPage.Size = UDim2.new(1, 0, 0, 145)
 hpPage.Position = UDim2.fromOffset(0, 30)
 hpPage.BackgroundTransparency = 1
 hpPage.Visible = false
 hpPage.ZIndex = 3
 hpPage.Parent = panel
 
-local hpTitle = Instance.new("TextLabel")
-hpTitle.Size = UDim2.fromOffset(234, 24)
-hpTitle.Position = UDim2.fromOffset(8, 56)
-hpTitle.BackgroundTransparency = 1
-hpTitle.Text = "Serpent"
-hpTitle.TextColor3 = TEXT
-hpTitle.Font = Enum.Font.GothamBold
-hpTitle.TextSize = 18
-hpTitle.ZIndex = 4
-hpTitle.Parent = hpPage
-
-local hpValue = Instance.new("TextLabel")
-hpValue.Size = UDim2.fromOffset(234, 24)
-hpValue.Position = UDim2.fromOffset(8, 90)
-hpValue.BackgroundTransparency = 1
-hpValue.Text = "—"
-hpValue.TextColor3 = MUTED
-hpValue.Font = Enum.Font.GothamBold
-hpValue.TextSize = 16
-hpValue.ZIndex = 4
-hpValue.Parent = hpPage
-
 local autoLabel = Instance.new("TextLabel")
-autoLabel.Size = UDim2.fromOffset(170, 16)
-autoLabel.Position = UDim2.fromOffset(10, 5)
+autoLabel.Size = UDim2.fromOffset(170, 22)
+autoLabel.Position = UDim2.fromOffset(10, 6)
 autoLabel.BackgroundTransparency = 1
 autoLabel.Text = "авто execute"
 autoLabel.TextColor3 = TEXT
@@ -652,21 +782,9 @@ autoLabel.TextXAlignment = Enum.TextXAlignment.Left
 autoLabel.ZIndex = 3
 autoLabel.Parent = mainPage
 
-local autoHint = Instance.new("TextLabel")
-autoHint.Size = UDim2.fromOffset(180, 12)
-autoHint.Position = UDim2.fromOffset(10, 20)
-autoHint.BackgroundTransparency = 1
-autoHint.Text = "запуск скрипта после телепорта"
-autoHint.TextColor3 = MUTED
-autoHint.Font = Enum.Font.GothamMedium
-autoHint.TextSize = 9
-autoHint.TextXAlignment = Enum.TextXAlignment.Left
-autoHint.ZIndex = 3
-autoHint.Parent = mainPage
-
 local switch = Instance.new("TextButton")
 switch.Size = UDim2.fromOffset(46, 22)
-switch.Position = UDim2.fromOffset(194, 4)
+switch.Position = UDim2.fromOffset(194, 6)
 switch.BackgroundColor3 = Color3.fromRGB(64, 53, 73)
 switch.BorderSizePixel = 0
 switch.AutoButtonColor = false
@@ -686,7 +804,7 @@ corner(knob, 8)
 
 local loaderLabel = Instance.new("TextLabel")
 loaderLabel.Size = UDim2.fromOffset(230, 14)
-loaderLabel.Position = UDim2.fromOffset(10, 35)
+loaderLabel.Position = UDim2.fromOffset(10, 36)
 loaderLabel.BackgroundTransparency = 1
 loaderLabel.Text = "скрипт (URL или путь к файлу)"
 loaderLabel.TextColor3 = MUTED
@@ -697,13 +815,14 @@ loaderLabel.ZIndex = 3
 loaderLabel.Parent = mainPage
 
 local loaderBox = Instance.new("TextBox")
-loaderBox.Size = UDim2.fromOffset(230, 24)
-loaderBox.Position = UDim2.fromOffset(10, 51)
+loaderBox.Size = UDim2.fromOffset(230, 26)
+loaderBox.Position = UDim2.fromOffset(10, 53)
 loaderBox.BackgroundColor3 = FIELD
 loaderBox.BorderSizePixel = 0
+loaderBox.ClipsDescendants = true
 loaderBox.ClearTextOnFocus = false
 loaderBox.Text = settings.loader
-loaderBox.PlaceholderText = "assist_astra.lua или https://..."
+loaderBox.PlaceholderText = "https://... или путь к файлу"
 loaderBox.PlaceholderColor3 = Color3.fromRGB(118, 105, 130)
 loaderBox.TextColor3 = TEXT
 loaderBox.Font = Enum.Font.GothamMedium
@@ -724,33 +843,50 @@ boxStroke.Thickness = 1
 boxStroke.Transparency = 0.2
 boxStroke.Parent = loaderBox
 
-local resetButton = Instance.new("TextButton")
-resetButton.Size = UDim2.fromOffset(148, 28)
-resetButton.Position = UDim2.fromOffset(10, 82)
-resetButton.BackgroundColor3 = Color3.fromRGB(92, 45, 48)
-resetButton.BorderSizePixel = 0
-resetButton.Text = "сбросить посещённые"
-resetButton.TextColor3 = Color3.fromRGB(255, 221, 215)
-resetButton.Font = Enum.Font.GothamMedium
-resetButton.TextSize = 11
-resetButton.ZIndex = 3
-resetButton.Parent = mainPage
-corner(resetButton, 5)
-hover(resetButton, Color3.fromRGB(92, 45, 48), Color3.fromRGB(112, 55, 58))
+local function makeStatusRow(nameText, yPos)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.fromOffset(234, 20)
+    row.Position = UDim2.fromOffset(8, yPos)
+    row.BackgroundColor3 = FIELD
+    row.BorderSizePixel = 0
+    row.ZIndex = 4
+    row.Parent = hpPage
+    corner(row, 5)
 
-local copyScriptButton = Instance.new("TextButton")
-copyScriptButton.Size = UDim2.fromOffset(74, 28)
-copyScriptButton.Position = UDim2.fromOffset(166, 82)
-copyScriptButton.BackgroundColor3 = Color3.fromRGB(52, 42, 62)
-copyScriptButton.BorderSizePixel = 0
-copyScriptButton.Text = "код скрипта"
-copyScriptButton.TextColor3 = TEXT
-copyScriptButton.Font = Enum.Font.GothamMedium
-copyScriptButton.TextSize = 9
-copyScriptButton.ZIndex = 3
-copyScriptButton.Parent = mainPage
-corner(copyScriptButton, 5)
-hover(copyScriptButton, Color3.fromRGB(52, 42, 62), Color3.fromRGB(64, 52, 76))
+    local nameLbl = Instance.new("TextLabel")
+    nameLbl.Size = UDim2.fromOffset(104, 20)
+    nameLbl.Position = UDim2.fromOffset(8, 0)
+    nameLbl.BackgroundTransparency = 1
+    nameLbl.Text = nameText
+    nameLbl.TextColor3 = TEXT
+    nameLbl.Font = Enum.Font.GothamBold
+    nameLbl.TextSize = 11
+    nameLbl.TextXAlignment = Enum.TextXAlignment.Left
+    nameLbl.ZIndex = 5
+    nameLbl.Parent = row
+
+    local valLbl = Instance.new("TextLabel")
+    valLbl.Size = UDim2.fromOffset(114, 20)
+    valLbl.Position = UDim2.fromOffset(112, 0)
+    valLbl.BackgroundTransparency = 1
+    valLbl.Text = "—"
+    valLbl.TextColor3 = MUTED
+    valLbl.Font = Enum.Font.GothamBold
+    valLbl.TextSize = 11
+    valLbl.TextXAlignment = Enum.TextXAlignment.Right
+    valLbl.TextTruncate = Enum.TextTruncate.AtEnd
+    valLbl.ZIndex = 5
+    valLbl.Parent = row
+
+    return valLbl
+end
+
+local serpentRowVal = makeStatusRow("Serpent", 5)
+local depthKingRowVal = makeStatusRow("Depth King", 28)
+local tyrantRowVal = makeStatusRow("Abyssal Tyrant", 51)
+local drakenfyrRowVal = makeStatusRow("Drakenfyr", 74)
+local crabRowVal = makeStatusRow("Deepsea Crusher", 97)
+local krakenRowVal = makeStatusRow("Chaos Kraken", 120)
 
 local function formatNumber(value)
     local text = tostring(math.floor(value + 0.5))
@@ -761,146 +897,590 @@ local function formatNumber(value)
     return formatted
 end
 
-local function readHealthValue(node, names, deep)
-    for _, name in ipairs(names) do
-        local attribute = node:GetAttribute(name)
-        if type(attribute) == "number" then return attribute end
+local function formatDuration(seconds)
+    local total = math.max(0, math.floor(seconds + 0.5))
+    local hours = math.floor(total / 3600)
+    local mins = math.floor((total % 3600) / 60)
+    local secs = total % 60
+    if hours > 0 then
+        return string.format("%d:%02d:%02d", hours, mins, secs)
     end
-    for _, name in ipairs(names) do
-        local object = node:FindFirstChild(name)
-        if object then
-            if object:IsA("NumberValue") or object:IsA("IntValue") then
-                return object.Value
-            elseif object:IsA("StringValue") then
-                local number = tonumber((object.Value:gsub(",", "")))
-                if number then return number end
+    return string.format("%02d:%02d", mins, secs)
+end
+
+local function normalizeKey(str)
+    return (tostring(str or ""):lower():gsub("[%s_%-]", ""))
+end
+
+local function getServerNow()
+    local ok, now = pcall(function()
+        return workspace:GetServerTimeNow()
+    end)
+    if ok and type(now) == "number" and now > 0 then
+        return now
+    end
+    return os.time()
+end
+
+local healthAttrNames = {"Health", "HP", "CurrentHealth", "HealthValue"}
+local maxHealthAttrNames = {"MaxHealth", "MaxHP", "HealthMax", "MaximumHealth"}
+
+local function findHealthValuesInNode(node, deep)
+    if not node then return nil end
+
+    local humanoid = node:FindFirstChildOfClass("Humanoid")
+    if humanoid and humanoid.MaxHealth > 0 then
+        return { kind = "humanoid", object = humanoid }
+    end
+
+    for _, name in ipairs(healthAttrNames) do
+        if type(node:GetAttribute(name)) == "number" then
+            local maxAttr
+            for _, mName in ipairs(maxHealthAttrNames) do
+                if type(node:GetAttribute(mName)) == "number" then
+                    maxAttr = mName
+                    break
+                end
             end
+            return { kind = "attr", object = node, attr = name, maxAttr = maxAttr }
         end
     end
+
+    local hpObj, maxObj
+    for _, name in ipairs(healthAttrNames) do
+        local obj = node:FindFirstChild(name)
+        if obj and (obj:IsA("NumberValue") or obj:IsA("IntValue") or obj:IsA("StringValue")) then
+            hpObj = obj
+            break
+        end
+    end
+    if hpObj then
+        for _, mName in ipairs(maxHealthAttrNames) do
+            local obj = node:FindFirstChild(mName)
+            if obj and (obj:IsA("NumberValue") or obj:IsA("IntValue") or obj:IsA("StringValue")) then
+                maxObj = obj
+                break
+            end
+        end
+        return { kind = "value", hpObj = hpObj, maxObj = maxObj }
+    end
+
     if deep then
         for _, object in ipairs(node:GetDescendants()) do
-            if object:IsA("NumberValue") or object:IsA("IntValue") or object:IsA("StringValue") then
-                local objectName = object.Name:lower()
-                for _, name in ipairs(names) do
-                    if objectName == name:lower() then
-                        if object:IsA("StringValue") then
-                            local number = tonumber((object.Value:gsub(",", "")))
-                            if number then return number end
-                        else
-                            return object.Value
-                        end
-                    end
-                end
+            if object:IsA("Humanoid") and object.MaxHealth > 0 then
+                return { kind = "humanoid", object = object }
             end
         end
-    end
-end
-
-local function findSerpentModel()
-    local monster = workspace:FindFirstChild("Monster")
-    local boss = monster and monster:FindFirstChild("Boss")
-    local serpent = boss and boss:FindFirstChild("Serpent")
-    return serpent and serpent:FindFirstChild("SerpentModel"), serpent, boss
-end
-
-local function readHealthFromGui()
-    for _, object in ipairs(playerGui:GetDescendants()) do
-        if object:IsA("TextLabel") then
-            local current, maximum = (object.Text or ""):match("([%d,]+)%s*/%s*([%d,]+)")
-            if current then
-                local node = object
-                local context = ""
-                for _ = 1, 5 do
-                    node = node.Parent
-                    if not node then break end
-                    context = context .. " " .. node.Name
-                end
-                local matched = context:lower():find("serpent", 1, true)
-                if not matched then
-                    local parent = object.Parent
-                    if parent then
-                        for _, sibling in ipairs(parent:GetChildren()) do
-                            if sibling:IsA("TextLabel")
-                                and (sibling.Text or ""):lower():find("serpent", 1, true) then
-                                matched = true
-                                break
+        for _, object in ipairs(node:GetDescendants()) do
+            if object:IsA("NumberValue") or object:IsA("IntValue") then
+                local low = object.Name:lower()
+                for _, name in ipairs(healthAttrNames) do
+                    if low == name:lower() then
+                        local maxFound
+                        if object.Parent then
+                            for _, mName in ipairs(maxHealthAttrNames) do
+                                local sibling = object.Parent:FindFirstChild(mName)
+                                if sibling and (sibling:IsA("NumberValue") or sibling:IsA("IntValue")) then
+                                    maxFound = sibling
+                                    break
+                                end
                             end
                         end
+                        return { kind = "value", hpObj = object, maxObj = maxFound }
                     end
                 end
-                if matched then
-                    return tonumber((current:gsub(",", ""))), tonumber((maximum:gsub(",", "")))
+            end
+        end
+    end
+
+    return nil
+end
+
+local function readFromHealthSource(source)
+    if not source then return nil end
+    if source.kind == "humanoid" then
+        local h = source.object
+        if not h or not h.Parent then return nil end
+        return h.Health, h.MaxHealth
+    elseif source.kind == "attr" then
+        local obj = source.object
+        if not obj or not obj.Parent then return nil end
+        local hp = obj:GetAttribute(source.attr)
+        if type(hp) ~= "number" then return nil end
+        local maxHp = source.maxAttr and obj:GetAttribute(source.maxAttr) or nil
+        return hp, maxHp
+    elseif source.kind == "value" then
+        local hpObj = source.hpObj
+        if not hpObj or not hpObj.Parent then return nil end
+        local hp = hpObj:IsA("StringValue") and tonumber((hpObj.Value:gsub(",", ""))) or hpObj.Value
+        local maxHp
+        if source.maxObj and source.maxObj.Parent then
+            maxHp = source.maxObj:IsA("StringValue") and tonumber((source.maxObj.Value:gsub(",", ""))) or source.maxObj.Value
+        end
+        return hp, maxHp
+    end
+    return nil
+end
+
+local function nameHasExcluded(normName, exclude)
+    if not exclude then return false end
+    for _, ex in ipairs(exclude) do
+        if normName:find(ex, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function matchesAliases(normName, aliases, exclude)
+    if normName == "" or nameHasExcluded(normName, exclude) then return false end
+    for _, alias in ipairs(aliases) do
+        if normName == alias or normName:find(alias, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local function findBossHealthBarFrame(aliases, exclude)
+    local mainGui = playerGui:FindFirstChild("MainGui")
+    local starter = mainGui and mainGui:FindFirstChild("StarterFrame")
+    local bar = starter and starter:FindFirstChild("BossesHealthBar")
+    local frames = bar and bar:FindFirstChild("Frames")
+    if not frames then return nil end
+
+    for _, child in ipairs(frames:GetChildren()) do
+        if matchesAliases(normalizeKey(child.Name), aliases, exclude) then
+            return child
+        end
+        local hpFrame = child:FindFirstChild("HPFrame")
+        local bossNameLbl = hpFrame and hpFrame:FindFirstChild("BossName")
+        if bossNameLbl and bossNameLbl:IsA("TextLabel")
+            and matchesAliases(normalizeKey(bossNameLbl.Text), aliases, exclude) then
+            return child
+        end
+    end
+    return nil
+end
+
+local function readHealthFromBossBar(frameNode)
+    if not frameNode or not frameNode.Parent then return nil end
+    local hpFrame = frameNode:FindFirstChild("HPFrame") or frameNode
+    for _, obj in ipairs(hpFrame:GetDescendants()) do
+        if obj:IsA("TextLabel") then
+            local current, maximum = (obj.Text or ""):match("([%d,]+)%s*/%s*([%d,]+)")
+            if current then
+                local curNum = tonumber((current:gsub(",", "")))
+                local maxNum = tonumber((maximum:gsub(",", "")))
+                if curNum and maxNum and maxNum > 100 then
+                    return curNum, maxNum
                 end
             end
         end
     end
+    return nil
 end
 
-local function readSerpentHealth()
-    local model, serpent, boss = findSerpentModel()
-    if not model then return nil end
+local function findBossNodes(aliases, locNode, exclude)
+    local monster = workspace:FindFirstChild("Monster")
+    local boss = monster and monster:FindFirstChild("Boss")
+    local containers = {}
+    if boss then containers[#containers + 1] = boss end
+    if monster then containers[#containers + 1] = monster end
+    if locNode then containers[#containers + 1] = locNode end
+    containers[#containers + 1] = workspace
 
-    local nodes = {model, serpent, boss}
-    for _, node in ipairs(nodes) do
-        local humanoid = node:FindFirstChildOfClass("Humanoid")
-        if humanoid and humanoid.MaxHealth > 0 then
-            return humanoid.Health, humanoid.MaxHealth
+    for _, container in ipairs(containers) do
+        for _, child in ipairs(container:GetChildren()) do
+            if (container ~= workspace or child:IsA("Model") or child:IsA("Folder"))
+                and matchesAliases(normalizeKey(child.Name), aliases, exclude) then
+                local model = child:FindFirstChild(child.Name .. "Model")
+                    or child:FindFirstChild("Model")
+                    or child
+                return model, child, boss
+            end
         end
     end
+    return nil
+end
 
-    for _, object in ipairs(model:GetDescendants()) do
-        if object:IsA("Humanoid") and object.MaxHealth > 0 then
-            return object.Health, object.MaxHealth
+local function parseTimerText(rawText, allowShortMinute)
+    if type(rawText) ~= "string" then return nil end
+    local text = rawText:gsub("<[^>]*>", ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if text == "" then return nil end
+
+    local lower = text:lower()
+
+    -- Игнорируем дистанцию ("250m", "120 m", "300 studs") и HP ("100/200")
+    if lower:find("stud", 1, true) or lower:find("km", 1, true) then
+        return nil
+    end
+    if text:match("^%[?%s*%d+[%.,]?%d*%s*[mMмМ]%s*%]?$") and not allowShortMinute then
+        return nil
+    end
+
+    local hms = text:match("(%d+:%d%d:%d%d)")
+    if hms then return hms, false end
+
+    local ms = text:match("(%d+:%d%d)")
+    if ms then return ms, false end
+
+    local h = tonumber(text:match("(%d+)%s*[hHчЧ]")) or 0
+    local m = tonumber(text:match("(%d+)%s*[mMмМ]")) or 0
+    local s = tonumber(text:match("(%d+)%s*[sSсС]")) or 0
+
+    local hasTimerWord = lower:find("spawn", 1, true)
+        or lower:find("time", 1, true)
+        or lower:find("cd", 1, true)
+        or lower:find("wait", 1, true)
+        or lower:find("left", 1, true)
+        or lower:find("in ", 1, true)
+        or lower:find("спавн", 1, true)
+        or lower:find("остал", 1, true)
+        or lower:find("через", 1, true)
+
+    if (h > 0 and m > 0) or s > 0 or (h > 0 and (allowShortMinute or hasTimerWord)) or (m > 0 and (allowShortMinute or hasTimerWord)) then
+        return formatDuration(h * 3600 + m * 60 + s), false
+    end
+
+    if lower:find("spawned", 1, true)
+        or lower:find("alive", 1, true)
+        or lower:find("ready", 1, true)
+        or lower:find("заспавн", 1, true) then
+        return "заспавнился", true
+    end
+
+    return nil
+end
+
+local timestampKeys = {
+    "nextspawn", "spawnat", "respawnat", "endtime", "targettime", "expiretime",
+}
+local countdownKeys = {
+    "timeleft", "remainingtime", "remaining", "countdown", "timer", "cooldownleft",
+    "respawnleft", "waittime", "cd",
+}
+local startKeys = {"lastspawn", "killedat", "deathtime", "starttime", "despawntime"}
+local durationKeys = {"interval", "respawntime", "spawndelay", "cooldown", "spawntime", "duration"}
+
+local function nameMatchesAny(name, list)
+    local lower = tostring(name or ""):lower()
+    for _, key in ipairs(list) do
+        if lower:find(key, 1, true) then
+            return true
         end
     end
+    return false
+end
 
-    for _, node in ipairs(nodes) do
-        local deep = node == model
-        local health = readHealthValue(node, {"Health", "HP", "CurrentHealth", "HealthValue"}, deep)
-        local maximum = readHealthValue(node, {"MaxHealth", "MaxHP", "HealthMax", "MaximumHealth"}, deep)
-        if health then return health, maximum end
+local function hasTimerHint(name)
+    local lower = tostring(name or ""):lower()
+    return lower:find("time", 1, true)
+        or lower:find("spawn", 1, true)
+        or lower:find("cd", 1, true)
+        or lower:find("cool", 1, true)
+        or lower:find("wait", 1, true)
+        or lower:find("respawn", 1, true)
+        or lower:find("count", 1, true)
+end
+
+local function evalTimestampOrSeconds(val, isTimestamp)
+    if type(val) ~= "number" then return nil end
+    if val > 1000000000 then
+        local rem = val - getServerNow()
+        if rem > 0 and rem <= 86400 then
+            return formatDuration(rem), false
+        end
+        return nil
+    end
+    if not isTimestamp and val > 0 and val <= 86400 then
+        return formatDuration(val), false
+    end
+    return nil
+end
+
+local function findTimerSourceInNode(node)
+    if not node then return nil end
+
+    if type(node:GetAttribute("Text")) == "string" then
+        return { kind = "attrStr", node = node, attr = "Text", hinted = false }
     end
 
-    for _, object in ipairs(model:GetDescendants()) do
-        if object:IsA("TextLabel") then
-            local current, maximum = object.Text:match("([%d,]+)%s*/%s*([%d,]+)")
-            if current then
-                return tonumber((current:gsub(",", ""))), tonumber((maximum:gsub(",", "")))
+    local function checkNode(target)
+        local okAttrs, attrs = pcall(function()
+            return target:GetAttributes()
+        end)
+        if okAttrs and type(attrs) == "table" then
+            if type(attrs.Text) == "string" then
+                return { kind = "attrStr", node = target, attr = "Text", hinted = false }
+            end
+
+            local startAttr, durAttr
+            for k, v in pairs(attrs) do
+                if type(v) == "number" then
+                    if nameMatchesAny(k, startKeys) then startAttr = k end
+                    if nameMatchesAny(k, durationKeys) then durAttr = k end
+                end
+            end
+            if startAttr and durAttr then
+                return { kind = "attrPair", node = target, startAttr = startAttr, durAttr = durAttr }
+            end
+
+            for k, v in pairs(attrs) do
+                if type(v) == "number" then
+                    if nameMatchesAny(k, timestampKeys) then
+                        return { kind = "attrNum", node = target, attr = k, isTimestamp = true }
+                    elseif nameMatchesAny(k, countdownKeys) then
+                        return { kind = "attrNum", node = target, attr = k, isTimestamp = false }
+                    elseif nameMatchesAny(k, {"spawntime", "respawntime", "cooldown"}) and v > 1000000000 then
+                        return { kind = "attrNum", node = target, attr = k, isTimestamp = true }
+                    end
+                elseif type(v) == "string" and hasTimerHint(k) then
+                    if parseTimerText(v, true) then
+                        return { kind = "attrStr", node = target, attr = k, hinted = true }
+                    end
+                end
+            end
+        end
+
+        local startObj, durObj
+        for _, child in ipairs(target:GetChildren()) do
+            if child:IsA("NumberValue") or child:IsA("IntValue") then
+                if nameMatchesAny(child.Name, startKeys) then startObj = child end
+                if nameMatchesAny(child.Name, durationKeys) then durObj = child end
+            end
+        end
+        if startObj and durObj then
+            return { kind = "valuePair", startObj = startObj, durObj = durObj }
+        end
+
+        return nil
+    end
+
+    local direct = checkNode(node)
+    if direct then return direct end
+
+    for _, desc in ipairs(node:GetDescendants()) do
+        local found = checkNode(desc)
+        if found then return found end
+
+        if desc:IsA("NumberValue") or desc:IsA("IntValue") then
+            if nameMatchesAny(desc.Name, timestampKeys) then
+                return { kind = "valueNum", obj = desc, isTimestamp = true }
+            elseif nameMatchesAny(desc.Name, countdownKeys) then
+                return { kind = "valueNum", obj = desc, isTimestamp = false }
+            elseif nameMatchesAny(desc.Name, {"spawntime", "respawntime", "cooldown"}) and desc.Value > 1000000000 then
+                return { kind = "valueNum", obj = desc, isTimestamp = true }
+            end
+        elseif desc:IsA("StringValue") then
+            local hinted = hasTimerHint(desc.Name)
+            if parseTimerText(desc.Value, hinted) then
+                return { kind = "stringObj", obj = desc, hinted = hinted }
+            end
+        elseif desc:IsA("TextLabel") then
+            local hinted = hasTimerHint(desc.Name)
+                or (desc.Parent and hasTimerHint(desc.Parent.Name))
+            if parseTimerText(desc.Text, hinted) then
+                return { kind = "textLabel", obj = desc, hinted = hinted }
             end
         end
     end
 
-    return readHealthFromGui()
+    return nil
 end
 
-local function updateSerpentHp()
-    local health, maximum = readSerpentHealth()
-    if health then
-        if maximum and maximum > 0 then
-            hpValue.Text = formatNumber(health) .. "/" .. formatNumber(maximum)
-        else
-            hpValue.Text = formatNumber(health)
+local function readFromTimerSource(src)
+    if not src then return nil end
+
+    if src.kind == "attrPair" then
+        if not src.node or not src.node.Parent then return nil end
+        local s = src.node:GetAttribute(src.startAttr)
+        local d = src.node:GetAttribute(src.durAttr)
+        if type(s) == "number" and type(d) == "number" and d > 0 then
+            local rem = (s + d) - getServerNow()
+            if rem > 0 and rem <= 86400 then
+                return formatDuration(rem), false
+            end
         end
-        hpValue.TextColor3 = health > 0 and SUCCESS or DANGER
+    elseif src.kind == "attrNum" then
+        if not src.node or not src.node.Parent then return nil end
+        local v = src.node:GetAttribute(src.attr)
+        return evalTimestampOrSeconds(v, src.isTimestamp)
+    elseif src.kind == "attrStr" then
+        if not src.node or not src.node.Parent then return nil end
+        local v = src.node:GetAttribute(src.attr)
+        return parseTimerText(v, src.hinted)
+    elseif src.kind == "valuePair" then
+        if not src.startObj or not src.startObj.Parent or not src.durObj or not src.durObj.Parent then return nil end
+        local s = src.startObj.Value
+        local d = src.durObj.Value
+        if type(s) == "number" and type(d) == "number" and d > 0 then
+            local rem = (s + d) - getServerNow()
+            if rem > 0 and rem <= 86400 then
+                return formatDuration(rem), false
+            end
+        end
+    elseif src.kind == "valueNum" then
+        if not src.obj or not src.obj.Parent then return nil end
+        return evalTimestampOrSeconds(src.obj.Value, src.isTimestamp)
+    elseif src.kind == "stringObj" then
+        if not src.obj or not src.obj.Parent then return nil end
+        return parseTimerText(src.obj.Value, src.hinted)
+    elseif src.kind == "textLabel" then
+        if not src.obj or not src.obj.Parent then return nil end
+        return parseTimerText(src.obj.Text, src.hinted)
+    end
+
+    return nil
+end
+
+local bossConfigs = {
+    { key = "serpent", label = serpentRowVal, aliases = {"serpent"}, exclude = {"serpentforger"}, hasHp = true, parents = {"Areas", "Island"}, locNames = {"SerpentLocation"}, checkWhirlpool = true },
+    { key = "depthking", label = depthKingRowVal, aliases = {"depthking"}, hasHp = true, parents = {"Areas", "Island"}, locNames = {"DepthKingLocation"} },
+    { key = "tyrant", label = tyrantRowVal, aliases = {"seadragon", "abyssaltyrant"}, hasHp = true, parents = {"Island", "Areas"}, locNames = {"SeaDragonLocation", "AbyssalTyrantLocation"} },
+    { key = "drakenfyr", label = drakenfyrRowVal, aliases = {"thirdseadragon", "drakenfyr"}, hasHp = true, parents = {"Island", "Areas"}, locNames = {"ThirdSeaDragonLocation", "DrakenfyrLocation", "DragonLocation"} },
+    { key = "crab", label = crabRowVal, aliases = {"thirdseaeldritchcrab", "eldritchcrab", "deepseacrusher"}, exclude = {"chaoscrab", "craberno"}, hasHp = true, parents = {"Island", "Areas"}, locNames = {"CrabLocation"} },
+    { key = "kraken", label = krakenRowVal, aliases = {"chaoskraken", "furytentacle"}, exclude = {"galleon"}, hasHp = true, parents = {"Island", "Areas"}, locNames = {"KrakenLocation"} },
+}
+
+local function getLocationNode(cfg)
+    if cfg.locNode and cfg.locNode.Parent then
+        return cfg.locNode
+    end
+    for _, parentName in ipairs(cfg.parents) do
+        local parent = workspace:FindFirstChild(parentName)
+        if parent then
+            for _, name in ipairs(cfg.locNames) do
+                local node = parent:FindFirstChild(name)
+                if node then
+                    cfg.locNode = node
+                    cfg.timerSource = nil
+                    return node
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function updateBossConfig(cfg, now)
+    local locNode = getLocationNode(cfg)
+
+    if cfg.hasHp then
+        local hp, maxHp = readFromHealthSource(cfg.hpSource)
+        if not hp then
+            hp, maxHp = readHealthFromBossBar(cfg.barFrame)
+        end
+
+        if not hp and (now - (cfg.lastBossScan or 0)) >= 1.5 then
+            cfg.lastBossScan = now
+            local model, bossNode, bossFolder = findBossNodes(cfg.aliases, locNode, cfg.exclude)
+            if model then
+                cfg.modelRef = model
+                cfg.hpSource = findHealthValuesInNode(model, true)
+                    or findHealthValuesInNode(bossNode, false)
+                    or findHealthValuesInNode(bossFolder, false)
+                hp, maxHp = readFromHealthSource(cfg.hpSource)
+            else
+                cfg.modelRef = nil
+                cfg.hpSource = nil
+            end
+
+            if not hp then
+                cfg.barFrame = findBossHealthBarFrame(cfg.aliases, cfg.exclude)
+                hp, maxHp = readHealthFromBossBar(cfg.barFrame)
+            end
+        end
+
+        if hp then
+            if maxHp and maxHp > 0 then
+                cfg.label.Text = formatNumber(hp) .. "/" .. formatNumber(maxHp)
+            else
+                cfg.label.Text = formatNumber(hp)
+            end
+            cfg.label.TextColor3 = hp > 0 and SUCCESS or DANGER
+            return
+        end
+
+        if (cfg.modelRef and cfg.modelRef.Parent) or (cfg.barFrame and cfg.barFrame.Parent) then
+            cfg.label.Text = "жив"
+            cfg.label.TextColor3 = SUCCESS
+            return
+        end
+    end
+
+    local timerText, isActive = readFromTimerSource(cfg.timerSource)
+    if not timerText and locNode and (now - (cfg.lastTimerScan or 0)) >= 2.0 then
+        cfg.lastTimerScan = now
+        cfg.timerSource = findTimerSourceInNode(locNode)
+        timerText, isActive = readFromTimerSource(cfg.timerSource)
+    end
+
+    if timerText then
+        cfg.label.Text = timerText
+        cfg.label.TextColor3 = isActive and SUCCESS or ACCENT
         return
     end
 
-    if findSerpentModel() then
-        hpValue.Text = "—"
-        hpValue.TextColor3 = MUTED
-        return
+    if cfg.checkWhirlpool then
+        local effects = workspace:FindFirstChild("Effects")
+        local whirlpool = effects and effects:FindFirstChild("SerpentWhirlpool")
+        if whirlpool then
+            if not cfg.wpTimerSource or (now - (cfg.lastWpScan or 0)) >= 2.5 then
+                cfg.lastWpScan = now
+                cfg.wpTimerSource = findTimerSourceInNode(whirlpool)
+            end
+            local wpTimer, wpActive = readFromTimerSource(cfg.wpTimerSource)
+            if wpTimer then
+                cfg.label.Text = wpTimer
+                cfg.label.TextColor3 = wpActive and SUCCESS or ACCENT
+            else
+                cfg.label.Text = "whirlpool"
+                cfg.label.TextColor3 = ACCENT
+            end
+            return
+        end
     end
 
-    local effects = workspace:FindFirstChild("Effects")
-    local whirlpool = effects and effects:FindFirstChild("SerpentWhirlpool")
-    if whirlpool then
-        hpValue.Text = "whirlpool"
-        hpValue.TextColor3 = ACCENT
-        return
+    cfg.label.Text = "—"
+    cfg.label.TextColor3 = MUTED
+end
+
+local function updateAllBosses()
+    local now = os.clock()
+    for _, cfg in ipairs(bossConfigs) do
+        updateBossConfig(cfg, now)
+    end
+end
+
+local settingsOpen = false
+
+local function applyPanelLayout(animated)
+    local targetHeight = BASE_HEIGHT
+    local panelHeight = 120
+    local statusY = 82
+
+    if settingsOpen then
+        if settingsTab == "hp" then
+            targetHeight = HP_OPEN_HEIGHT
+            panelHeight = 175
+            statusY = 221
+        else
+            targetHeight = MAIN_OPEN_HEIGHT
+            panelHeight = 120
+            statusY = 166
+        end
     end
 
-    hpValue.Text = "не заспавнился"
-    hpValue.TextColor3 = MUTED
+    statusLabel.Position = UDim2.fromOffset(12, statusY)
+    if animated then
+        local info = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+        TweenService:Create(panel, info, {Size = UDim2.fromOffset(250, panelHeight)}):Play()
+        TweenService:Create(frame, info, {Size = UDim2.fromOffset(WIDTH, targetHeight)}):Play()
+    else
+        panel.Size = UDim2.fromOffset(250, panelHeight)
+        frame.Size = UDim2.fromOffset(WIDTH, targetHeight)
+    end
 end
 
 local function setSettingsTab(tab)
@@ -914,7 +1494,10 @@ local function setSettingsTab(tab)
     tabHp.BackgroundColor3 = hp and ACCENT or FIELD
     tabHp.TextColor3 = hp and Color3.fromRGB(36, 27, 44) or MUTED
 
-    if hp then updateSerpentHp() end
+    if settingsOpen then
+        applyPanelLayout(true)
+    end
+    if hp then updateAllBosses() end
 end
 
 setSettingsTab("main")
@@ -1007,7 +1590,6 @@ local function commitLoader()
     setStatus("скрипт сохранён", SUCCESS)
 end
 
-local settingsOpen = false
 local function setSettingsOpen(open)
     settingsOpen = open
     settingsButton.Text = open and "свернуть" or "настройки"
@@ -1015,12 +1597,9 @@ local function setSettingsOpen(open)
     refreshButton.Visible = not open
     findButton.Visible = not open
     panel.Visible = open
-    statusLabel.Position = UDim2.fromOffset(12, open and 216 or 82)
-    TweenService:Create(frame, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-        Size = UDim2.fromOffset(WIDTH, open and OPEN_HEIGHT or BASE_HEIGHT),
-    }):Play()
+    applyPanelLayout(true)
     if open and settingsTab == "hp" then
-        updateSerpentHp()
+        updateAllBosses()
     end
 end
 
@@ -1031,9 +1610,9 @@ end)
 task.spawn(function()
     while screen.Parent do
         if settingsOpen and settingsTab == "hp" then
-            updateSerpentHp()
+            updateAllBosses()
         end
-        task.wait(0.5)
+        task.wait(1)
     end
 end)
 
@@ -1042,46 +1621,6 @@ switch.MouseButton1Click:Connect(function()
 end)
 
 loaderBox.FocusLost:Connect(commitLoader)
-
-resetButton.MouseButton1Click:Connect(function()
-    table.clear(visited)
-    if type(delfile) == "function" then pcall(delfile, visitedFile) end
-    saveVisited()
-    setStatus("посещённые серверы сброшены · посещённых: " .. visitedCount(), SUCCESS)
-end)
-
-copyScriptButton.MouseButton1Click:Connect(function()
-    local target = settings.loader
-    if type(target) ~= "string" or target == "" then
-        setStatus("сначала укажи скрипт в поле выше", DANGER)
-        return
-    end
-
-    setStatus("читаю код скрипта...", MUTED)
-
-    local ok, code
-    if target:match("^https?://") then
-        ok, code = pcall(function()
-            return game:HttpGet(target)
-        end)
-    elseif type(readfile) == "function" then
-        ok, code = pcall(readfile, target)
-    else
-        setStatus("readfile недоступен", DANGER)
-        return
-    end
-
-    if not ok or type(code) ~= "string" or code == "" then
-        setStatus("не удалось прочитать: " .. target, DANGER)
-        return
-    end
-
-    if copyToClipboard(code) then
-        setStatus("код скрипта скопирован (" .. #code .. " байт)", SUCCESS)
-    else
-        setStatus("буфер обмена недоступен", DANGER)
-    end
-end)
 
 local function findNativeRefreshButton()
     local browser = findServerBrowser()
@@ -1173,6 +1712,10 @@ local function fetchServers()
         end
     end
 
+    if fetchRobloxPublicServers(3) then
+        success = true
+    end
+
     fetchingServers = false
     return success
 end
@@ -1199,9 +1742,10 @@ local function chooseServer()
     for _, server in ipairs(servers) do
         local key = normalizeId(server.id)
         if key and key ~= current
+            and not server.restricted
             and server.players < server.maxPlayers then
             candidates = candidates + 1
-            if visited[key] then
+            if visited[key] or failedServers[key] then
                 skippedVisited = skippedVisited + 1
             elseif not best or server.players < best.players then
                 best = server
@@ -1245,16 +1789,19 @@ end
 local function buildBootstrap(includeScript)
     local lines = {
         "local __assistVisited = " .. serializeVisited(),
-        "_G.AssistVisitedServers = __assistVisited",
+        "_G.AssistVisitedServers = _G.AssistVisitedServers or {}",
+        "for k, v in pairs(__assistVisited) do _G.AssistVisitedServers[k] = v end",
         "if type(getgenv) == \"function\" then",
         "    local envOk, env = pcall(getgenv)",
-        "    if envOk and type(env) == \"table\" then env.AssistVisitedServers = __assistVisited end",
+        "    if envOk and type(env) == \"table\" then env.AssistVisitedServers = _G.AssistVisitedServers end",
         "end",
     }
 
     if includeScript then
         local loaderCode, err = buildLoaderCode()
         if not loaderCode then return nil, err end
+        lines[#lines + 1] = "if _G.__AssistAutoExecuted then return end"
+        lines[#lines + 1] = "_G.__AssistAutoExecuted = true"
         lines[#lines + 1] = "local Players = game:GetService(\"Players\")"
         lines[#lines + 1] = "repeat task.wait(0.2) until game:IsLoaded() and Players.LocalPlayer"
         lines[#lines + 1] = "task.wait(0.5)"
@@ -1267,34 +1814,34 @@ local function buildBootstrap(includeScript)
     return table.concat(lines, "\n")
 end
 
+local MAX_TELEPORT_RETRIES = 15
 local finding = false
 local pendingTargetKey
+local teleportAttemptId = 0
+local currentRetryCount = 0
 
-local function clearPending()
-    if pendingTargetKey then
-        unmarkVisited(pendingTargetKey)
-        saveVisited()
-        pendingTargetKey = nil
+local function stopFinding(message, color)
+    finding = false
+    teleportAttemptId = teleportAttemptId + 1
+    pendingTargetKey = nil
+    findButton.Text = "найти сервер"
+    if message then
+        setStatus(message, color)
     end
 end
 
-findButton.MouseButton1Click:Connect(function()
-    if finding or fetchingServers then return end
-
-    if #servers == 0 then
-        setStatus("получаю список серверов...", MUTED)
-        if not fetchServers() then
-            setStatus("не удалось получить список — попробуй ещё раз", DANGER)
-            return
-        end
-    end
+local function attemptTeleport(retryCount)
+    if not finding then return end
+    currentRetryCount = retryCount
 
     local target, candidates, skippedVisited = chooseServer()
     if not target then
-        if candidates > 0 and skippedVisited == candidates then
-            setStatus("все подходящие серверы уже посещены", MUTED)
+        if retryCount > 0 then
+            stopFinding("подходящие серверы закончились", DANGER)
+        elseif candidates > 0 and skippedVisited == candidates then
+            stopFinding("все подходящие серверы уже посещены", MUTED)
         else
-            setStatus("нет подходящих серверов", DANGER)
+            stopFinding("нет подходящих серверов", DANGER)
         end
         return
     end
@@ -1307,29 +1854,40 @@ findButton.MouseButton1Click:Connect(function()
 
     local queueFn = getQueueFunction()
     if settings.autoExecute and not queueFn then
-        clearPending()
-        setStatus("executor не поддерживает авто-запуск", DANGER)
+        if pendingTargetKey then
+            unmarkVisited(pendingTargetKey)
+            saveVisited()
+        end
+        stopFinding("executor не поддерживает авто-запуск", DANGER)
         return
     end
 
     if queueFn then
         local bootstrap, err = buildBootstrap(settings.autoExecute)
         if not bootstrap then
-            clearPending()
-            setStatus(err, DANGER)
+            if pendingTargetKey then
+                unmarkVisited(pendingTargetKey)
+                saveVisited()
+            end
+            stopFinding(err, DANGER)
             return
         end
 
         local ok, queueErr = pcall(queueFn, bootstrap)
         if not ok and settings.autoExecute then
-            clearPending()
-            setStatus("ошибка очереди: " .. tostring(queueErr), DANGER)
+            if pendingTargetKey then
+                unmarkVisited(pendingTargetKey)
+                saveVisited()
+            end
+            stopFinding("ошибка очереди: " .. tostring(queueErr), DANGER)
             return
         end
     end
 
-    finding = true
-    findButton.Text = "телепорт..."
+    teleportAttemptId = teleportAttemptId + 1
+    local thisAttempt = teleportAttemptId
+
+    findButton.Text = "отмена"
     local targetLabel = target.name and target.name:match("#%s*%d+") or target.id:sub(1, 8)
     setStatus(string.format("телепорт: %d/%d · %s", target.players, target.maxPlayers, targetLabel), ACCENT)
 
@@ -1338,23 +1896,77 @@ findButton.MouseButton1Click:Connect(function()
     end)
 
     if not ok then
-        clearPending()
-        finding = false
-        findButton.Text = "найти сервер"
-        setStatus("не удалось начать телепорт", DANGER)
+        if pendingTargetKey then
+            failedServers[pendingTargetKey] = true
+            pendingTargetKey = nil
+        end
+        if retryCount < MAX_TELEPORT_RETRIES then
+            setStatus("ошибка запуска — ищу другой...", ACCENT)
+            task.wait(0.25)
+            if finding and teleportAttemptId == thisAttempt then
+                attemptTeleport(retryCount + 1)
+            end
+        else
+            stopFinding("не удалось начать телепорт", DANGER)
+        end
         return
     end
 
-    task.delay(5, function()
-        finding = false
-        findButton.Text = "найти сервер"
+    task.delay(15, function()
+        if finding and teleportAttemptId == thisAttempt then
+            stopFinding("таймаут телепорта — попробуй снова", DANGER)
+        end
+    end)
+end
+
+findButton.MouseButton1Click:Connect(function()
+    if fetchingServers then return end
+    if finding then
+        stopFinding("поиск отменён", MUTED)
+        return
+    end
+
+    task.spawn(function()
+        if #servers == 0 then
+            setStatus("получаю список серверов...", MUTED)
+            if not fetchServers() then
+                setStatus("не удалось получить список — попробуй ещё раз", DANGER)
+                return
+            end
+        elseif #publicServers == 0 then
+            setStatus("ищу самые маленькие серверы...", MUTED)
+            fetchRobloxPublicServers(3)
+        end
+
+        finding = true
+        attemptTeleport(0)
     end)
 end)
 
 TeleportService.TeleportInitFailed:Connect(function(_, _, message)
     if not finding then return end
-    clearPending()
-    finding = false
-    findButton.Text = "найти сервер"
-    setStatus("телепорт не удался: " .. tostring(message), DANGER)
+
+    pcall(function()
+        GuiService:ClearError()
+    end)
+
+    if pendingTargetKey then
+        failedServers[pendingTargetKey] = true
+        visited[pendingTargetKey] = true
+        saveVisited()
+        pendingTargetKey = nil
+    end
+
+    if currentRetryCount < MAX_TELEPORT_RETRIES then
+        local attemptAtFail = teleportAttemptId
+        setStatus("сервер недоступен — ищу другой...", ACCENT)
+        task.spawn(function()
+            task.wait(0.35)
+            if finding and teleportAttemptId == attemptAtFail then
+                attemptTeleport(currentRetryCount + 1)
+            end
+        end)
+    else
+        stopFinding("телепорт не удался: " .. tostring(message), DANGER)
+    end
 end)
