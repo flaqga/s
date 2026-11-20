@@ -238,6 +238,76 @@ local function readNumber(server, keys)
 end
 
 local nameFields = {"Name", "ServerName", "DisplayName", "Code", "ServerCode", "ShortCode", "Title"}
+local regionFields = {
+    "Region", "region", "Country", "country", "CountryName", "countryName",
+    "CountryCode", "countryCode", "Location", "location",
+    "ServerRegion", "serverRegion", "Area", "area", "Zone", "zone", "Geo", "geo",
+}
+
+local usExact = {
+    us = true, usa = true, ["united states"] = true, ["united states of america"] = true,
+    ["u.s."] = true, ["u.s.a."] = true,
+}
+
+local usKeywords = {
+    "united states", "ashburn", "virginia", "oregon", "boardman",
+    "california", "san jose", "los angeles", "santa clara",
+    "texas", "dallas", "florida", "miami", "new york", "newark",
+    "new jersey", "secaucus", "illinois", "chicago", "georgia",
+    "atlanta", "washington", "seattle", "ohio", "arizona", "utah",
+}
+
+local function isUnitedStatesRegion(region)
+    if type(region) ~= "string" or region == "" then return false end
+    local low = region:lower():gsub("^%s+", ""):gsub("%s+$", "")
+    if usExact[low] then return true end
+    if low:match("^us[%s%-_,]") or low:match("[%s%-_,]us$") or low:match("^usa[%s%-_,]") then
+        return true
+    end
+    for _, kw in ipairs(usKeywords) do
+        if low:find(kw, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+local knownCountryHints = {
+    "united states", "germany", "singapore", "japan", "brazil", "united kingdom",
+    "france", "netherlands", "australia", "canada", "korea", "india", "poland",
+    "russia", "finland", "sweden", "ireland", "spain", "italy", "hong kong",
+    "taiwan", "indonesia", "philippines", "thailand", "vietnam", "malaysia",
+}
+
+local function readServerRegion(server)
+    for _, field in ipairs(regionFields) do
+        local value = server[field]
+        if type(value) == "string" then
+            local text = value:gsub("^%s+", ""):gsub("%s+$", "")
+            if text ~= "" then
+                return text
+            end
+        end
+    end
+
+    for field, value in pairs(server) do
+        if type(value) == "string" then
+            local low = value:lower():gsub("^%s+", ""):gsub("%s+$", "")
+            if low ~= "" and not tostring(field):lower():find("job", 1, true) then
+                if isUnitedStatesRegion(low) then
+                    return value:gsub("^%s+", ""):gsub("%s+$", "")
+                end
+                for _, hint in ipairs(knownCountryHints) do
+                    if low:find(hint, 1, true) then
+                        return value:gsub("^%s+", ""):gsub("%s+$", "")
+                    end
+                end
+            end
+        end
+    end
+
+    return nil
+end
 
 local function readServerName(server)
     for _, field in ipairs(nameFields) do
@@ -276,10 +346,14 @@ local function isRestrictedServer(server)
     return false
 end
 
+local serverRegionsByCode = {}
+local hasKnownRegionData = false
+
 local function rebuildServerList(remoteList)
     local byKey = {}
     local merged = {}
     local currentKey = normalizeId(game.JobId)
+    hasKnownRegionData = false
 
     local function upsert(entry)
         local key = normalizeId(entry.id)
@@ -288,6 +362,11 @@ local function rebuildServerList(remoteList)
         local existing = byKey[key]
         if existing then
             if entry.name and not existing.name then existing.name = entry.name end
+            if entry.region and not existing.region then
+                existing.region = entry.region
+                existing.isUS = entry.isUS
+            end
+            if entry.isUS then existing.isUS = true end
             if entry.restricted then existing.restricted = true end
             if entry.players and (not existing.players or entry.source == "roblox") then
                 existing.players = entry.players
@@ -307,6 +386,20 @@ local function rebuildServerList(remoteList)
         upsert(entry)
     end
 
+    for _, entry in ipairs(merged) do
+        if not entry.region and entry.name then
+            local code = entry.name:match("#%s*(%d+)")
+            local uiRegion = code and serverRegionsByCode[code]
+            if uiRegion then
+                entry.region = uiRegion
+                entry.isUS = isUnitedStatesRegion(uiRegion)
+            end
+        end
+        if entry.region then
+            hasKnownRegionData = true
+        end
+    end
+
     table.sort(merged, function(a, b)
         return (a.players or 999) < (b.players or 999)
     end)
@@ -317,7 +410,9 @@ local function rebuildServerList(remoteList)
         local fresh = 0
         for _, entry in ipairs(merged) do
             local key = normalizeId(entry.id)
-            if key and key ~= currentKey and not entry.restricted and not visited[key] and not failedServers[key] then
+            if key and key ~= currentKey and not entry.restricted and not entry.isUS
+                and (not hasKnownRegionData or entry.region ~= nil)
+                and not visited[key] and not failedServers[key] then
                 fresh = fresh + 1
             end
         end
@@ -345,6 +440,7 @@ local function applyServers(result)
             local maxPlayers = readNumber(server, {"MaxPlayers", "Capacity", "Max", "maxPlayers", "capacity"}) or defaultMaxPlayers
             if id ~= "" and count and count <= maxPlayers then
                 local name = readServerName(server)
+                local region = readServerRegion(server)
                 local normalized = normalizeId(id)
                 if name and normalized then codes[normalized] = name end
                 if normalized and normalized == currentKey and name then
@@ -353,6 +449,8 @@ local function applyServers(result)
                 parsed[#parsed + 1] = {
                     id = id,
                     name = name,
+                    region = region,
+                    isUS = isUnitedStatesRegion(region),
                     placeId = tonumber(server.PlaceId) or game.PlaceId,
                     players = count,
                     maxPlayers = maxPlayers,
@@ -1673,6 +1771,41 @@ local function findNativeRefreshButton()
     return best
 end
 
+local function collectRegionsFromServerBrowserUi()
+    local browser = findServerBrowser()
+    local main = browser and browser:FindFirstChild("MainFrame")
+    if not main then return end
+
+    local updated = false
+    for _, obj in ipairs(main:GetDescendants()) do
+        if obj:IsA("TextLabel") and obj.Name == "IdLabel" then
+            local row = obj.Parent
+            local code = (obj.Text or ""):match("#?%s*(%d+)")
+            if row and code then
+                local regionText
+                for _, child in ipairs(row:GetDescendants()) do
+                    if child:IsA("TextLabel") and child ~= obj and child.Name ~= "NameLabel" then
+                        local cname = child.Name:lower()
+                        local txt = (child.Text or ""):gsub("<[^>]*>", ""):gsub("^%s+", ""):gsub("%s+$", "")
+                        if txt ~= "" and (cname:find("region", 1, true) or cname:find("country", 1, true) or cname:find("loc", 1, true) or isUnitedStatesRegion(txt)) then
+                            regionText = txt
+                            break
+                        end
+                    end
+                end
+                if regionText and serverRegionsByCode[code] ~= regionText then
+                    serverRegionsByCode[code] = regionText
+                    updated = true
+                end
+            end
+        end
+    end
+
+    if updated then
+        rebuildServerList(remoteServersCache)
+    end
+end
+
 local fetchingServers = false
 
 local function fetchServers()
@@ -1716,6 +1849,8 @@ local function fetchServers()
         success = true
     end
 
+    pcall(collectRegionsFromServerBrowserUi)
+
     fetchingServers = false
     return success
 end
@@ -1734,26 +1869,45 @@ refreshButton.MouseButton1Click:Connect(function()
 end)
 
 local function chooseServer()
-    local best
+    pcall(collectRegionsFromServerBrowserUi)
+
+    local bestKnownNonUS
+    local bestUnknown
     local current = normalizeId(game.JobId)
     local candidates = 0
     local skippedVisited = 0
+    local skippedUS = 0
 
     for _, server in ipairs(servers) do
         local key = normalizeId(server.id)
         if key and key ~= current
             and not server.restricted
             and server.players < server.maxPlayers then
-            candidates = candidates + 1
-            if visited[key] or failedServers[key] then
-                skippedVisited = skippedVisited + 1
-            elseif not best or server.players < best.players then
-                best = server
+            if server.isUS then
+                skippedUS = skippedUS + 1
+            else
+                candidates = candidates + 1
+                if visited[key] or failedServers[key] then
+                    skippedVisited = skippedVisited + 1
+                elseif server.region then
+                    if not bestKnownNonUS or server.players < bestKnownNonUS.players then
+                        bestKnownNonUS = server
+                    end
+                else
+                    if not bestUnknown or server.players < bestUnknown.players then
+                        bestUnknown = server
+                    end
+                end
             end
         end
     end
 
-    return best, candidates, skippedVisited
+    local chosen = bestKnownNonUS
+    if not chosen and not hasKnownRegionData then
+        chosen = bestUnknown
+    end
+
+    return chosen, candidates, skippedVisited, skippedUS
 end
 
 local function serializeVisited()
@@ -1834,12 +1988,14 @@ local function attemptTeleport(retryCount)
     if not finding then return end
     currentRetryCount = retryCount
 
-    local target, candidates, skippedVisited = chooseServer()
+    local target, candidates, skippedVisited, skippedUS = chooseServer()
     if not target then
         if retryCount > 0 then
             stopFinding("подходящие серверы закончились", DANGER)
         elseif candidates > 0 and skippedVisited == candidates then
-            stopFinding("все подходящие серверы уже посещены", MUTED)
+            stopFinding("все серверы вне US уже посещены", MUTED)
+        elseif skippedUS and skippedUS > 0 then
+            stopFinding("найдены только серверы United States", DANGER)
         else
             stopFinding("нет подходящих серверов", DANGER)
         end
@@ -1889,7 +2045,8 @@ local function attemptTeleport(retryCount)
 
     findButton.Text = "отмена"
     local targetLabel = target.name and target.name:match("#%s*%d+") or target.id:sub(1, 8)
-    setStatus(string.format("телепорт: %d/%d · %s", target.players, target.maxPlayers, targetLabel), ACCENT)
+    local regionLabel = target.region and (" · " .. target.region) or ""
+    setStatus(string.format("телепорт: %d/%d · %s%s", target.players, target.maxPlayers, targetLabel, regionLabel), ACCENT)
 
     local ok = pcall(function()
         TeleportService:TeleportToPlaceInstance(target.placeId, target.id, player)
